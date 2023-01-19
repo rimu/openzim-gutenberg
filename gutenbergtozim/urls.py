@@ -262,6 +262,11 @@ def setup_urls():
     load_csv(Url, file_with_url, field_names=field_names)
 
 
+def url_host(url):
+    parsed_url = urlparse.urlparse(url)
+    return parsed_url.netloc
+
+
 if __name__ == "__main__":
     book = Book.get(id=9)
     print(get_urls(book))

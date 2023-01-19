@@ -9,12 +9,13 @@ import tempfile
 import zipfile
 from pprint import pprint as pp
 from multiprocessing.dummy import Pool
+from collections import defaultdict
 
 import requests
 from path import Path as path
 
 from gutenbergtozim import logger, TMP_FOLDER
-from gutenbergtozim.urls import get_urls
+from gutenbergtozim.urls import get_urls, url_host
 from gutenbergtozim.database import BookFormat, Format, Book
 from gutenbergtozim.export import get_list_of_filtered_books, fname_for
 from gutenbergtozim.utils import (
@@ -109,7 +110,7 @@ def handle_zipped_epub(zippath, book, dst_dir):
 
 
 def download_book(
-    book, download_cache, languages, formats, force, s3_storage, optimizer_version
+    book, download_cache, languages, formats, force, s3_storage, optimizer_version, reliability_tracker
 ):
     logger.info("\tDownloading content files for Book #{id}".format(id=book.id))
 
@@ -264,8 +265,11 @@ def download_book(
                         downloaded_from_cache = True
                         break
                 if not download_file(url, zpath):
+                    reliability_tracker[url_host(url)]['failure'] += 1
                     logger.error("ZIP file download failed: {}".format(zpath))
                     continue
+                else:
+                    reliability_tracker[url_host(url)]['success'] += 1
                 # save etag
                 book.html_etag = etag
                 book.save()
@@ -294,8 +298,11 @@ def download_book(
                             downloaded_from_cache = True
                             break
                 if not download_file(url, unoptimized_fpath):
+                    reliability_tracker[url_host(url)]['failure'] += 1
                     logger.error("file download failed: {}".format(unoptimized_fpath))
                     continue
+                else:
+                    reliability_tracker[url_host(url)]['success'] += 1
                 # save etag if html or epub if download is successful
                 if (
                     url.endswith(".htm")
@@ -333,10 +340,20 @@ def download_book(
         if book_dir.exists():
             shutil.rmtree(book_dir, ignore_errors=True)
         return
-    download_cover(book, book_dir, s3_storage, optimizer_version)
+    download_cover(book, book_dir, s3_storage, optimizer_version, reliability_tracker)
+
+    for host, rt in reliability_tracker.items():
+        threshold = 16
+        if rt['failure'] > threshold and rt['success'] == 0:
+            logger.error(f"More than #{threshold} failures when connecting to ${host}, exiting.")
+            exit(1)
+        elif rt['failure'] > threshold and rt['success'] > 0:
+            if (rt['failure'] / rt['success'] * 100) > 10:
+                logger.error(f"Failed to download from ${host} during more than 10% of attempts, exiting.")
+                exit(1)
 
 
-def download_cover(book, book_dir, s3_storage, optimizer_version):
+def download_cover(book, book_dir, s3_storage, optimizer_version, reliability_tracker):
     has_cover = Book.select(Book.cover_page).where(Book.id == book.id)
     if has_cover:
         # try to download optimized cover from cache if s3_storage
@@ -365,8 +382,11 @@ def download_cover(book, book_dir, s3_storage, optimizer_version):
         if not downloaded_from_cache:
             logger.debug("Downloading {}".format(url))
             if download_file(url, book_dir.joinpath("unoptimized").joinpath(cover)):
+                reliability_tracker[url_host(url)]['success'] += 1
                 book.cover_etag = etag
                 book.save()
+            else:
+                reliability_tracker[url_host(url)]['failure'] += 1
     else:
         logger.debug("No Book Cover found for Book #{}".format(book.id))
 
@@ -388,9 +408,11 @@ def download_all_books(
     # ensure dir exist
     path(download_cache).mkdir_p()
 
+    reliability_tracker = defaultdict(lambda: defaultdict(lambda: 0))  # e.g. reliability_tracker['google.com']['success']
+
     def dlb(b):
         return download_book(
-            b, download_cache, languages, formats, force, s3_storage, optimizer_version
+            b, download_cache, languages, formats, force, s3_storage, optimizer_version, reliability_tracker
         )
 
     Pool(concurrency).map(dlb, available_books)
